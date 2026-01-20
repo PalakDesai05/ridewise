@@ -1,0 +1,2124 @@
+"""
+RideWise Flask Backend - Bike Demand Prediction
+- Dual endpoints: /predict/hour and /predict/day
+- Models loaded from saved_models/
+- Features extracted from model.feature_names_in_
+- CORS enabled for React frontend on http://localhost:3000
+- No login/authentication (demo mode)
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from joblib import load
+import pandas as pd
+import numpy as np
+import os
+import traceback
+import logging
+import random
+import json
+from dotenv import load_dotenv
+import smtplib
+from email.message import EmailMessage
+
+# Google Generative AI SDK
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+app = Flask(__name__)
+
+# Enable CORS for local dev origins (adjust in production)
+CORS(app, resources={r"/*": {"origins": [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001"
+]}})
+
+# Configure logging to stdout for easier debugging in terminals and containers
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# Configuration and model loading
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+MODEL_DIR = os.path.join(PROJECT_ROOT, 'saved_models')
+
+# Load .env from project root (if present) so GEMINI_API_KEY is available.
+# This will not override environment variables already set in the OS.
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
+load_dotenv(os.path.join(BASE_DIR, '.env'))
+
+# Configure GEMINI API key
+# Security: do not hardcode API keys in source control.
+# Set GEMINI_API_KEY via backend/.env or OS environment variables.
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+if genai is None:
+    logger.warning("google-genai SDK is not installed. Install it with 'pip install google-genai'.")
+else:
+    if GEMINI_API_KEY:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            # Use gemini-2.5-flash which is available and supports generateContent
+            model = genai.GenerativeModel('models/gemini-2.5-flash')
+            logger.info("Gemini client initialized successfully with model: gemini-2.5-flash")
+        except Exception as e:
+            logger.exception("Failed to initialize Gemini client: %s", e)
+            # Try fallback models
+            try:
+                logger.info("Trying fallback model: gemini-2.0-flash")
+                model = genai.GenerativeModel('models/gemini-2.0-flash')
+                logger.info("Gemini client initialized with fallback model: gemini-2.0-flash")
+            except Exception as e2:
+                logger.exception("Fallback model also failed: %s", e2)
+                model = None
+    else:
+        model = None
+        logger.warning("GEMINI_API_KEY not found in environment. Set it in backend/.env or system environment variables.")
+
+# System prompt used for all chatbot requests
+SYSTEM_PROMPT = """You are RideWise Assistant, a friendly and helpful voice-enabled AI chatbot for the RideWise bike-sharing demand prediction application.
+
+VOICE-ENABLED CHATBOT (STRICT RULES):
+- All your responses are automatically read aloud using Text-to-Speech
+- Responses are spoken point-by-point with natural pauses between points
+- Format answers to sound natural and clear when spoken
+- Even short answers (yes/no, one line) are read aloud
+- The spoken audio matches your text exactly
+- Maintain clear, natural, and calm voice in your responses
+
+ABOUT RIDEWISE:
+- RideWise is a bike-sharing demand prediction system that uses ML models to forecast bike rental demand
+- The app has multiple pages: Login, Signup, Dashboard, Prediction, Upload, Chatbot, and Profile
+- You have COMPLETE ACCESS to all application information, pages, features, processes, and current state
+- Users can make predictions based on weather conditions (temperature, humidity, weather situation), temporal factors (hour, day, season), and other features
+- The application includes authentication, real-time dashboard, prediction forms, file upload, and an AI chatbot assistant
+
+YOUR BEHAVIOR:
+- Be helpful, friendly, and enthusiastic
+- You have COMPLETE KNOWLEDGE of all pages, features, processes, and current application state
+- You can answer questions about ANY page, feature, or process in the application
+- When asked about features, pages, or how things work, provide detailed information from the context
+- If asked about predictions or dashboard, provide accurate information based on the context provided
+- When asked about prediction history, use the prediction history data provided in the context
+- Reference specific predictions by ID, date, or details when available in the history
+- Use simple, professional language suitable for students and developers
+
+RESPONSE FORMATTING RULES (STRICT - MUST FOLLOW):
+- ALWAYS answer in clear, numbered or bulleted points - NO EXCEPTIONS
+- Use headings where applicable (e.g., "## Dashboard Features", "## Steps to Make a Prediction")
+- Keep each point short, precise, and meaningful (1-2 lines max per point)
+- DO NOT write long paragraphs - break everything into points
+- Use sub-points for explanations instead of paragraphs
+- Maintain logical order: definition → explanation → example (if needed)
+- Use simple, professional language suitable for students and developers
+
+FORMATTING STRUCTURE:
+- For greetings: Use 1-2 brief points, then ask how you can help
+- For explanations: Always use numbered (1., 2., 3.) or bulleted (•) lists
+- For step-by-step guides: Use numbered lists (1., 2., 3.)
+- For feature lists: Use bulleted lists (•)
+- For definitions: Start with a heading, then use points
+- For comparisons: Use bulleted lists with sub-points if needed
+
+POINT FORMATTING:
+- Each point MUST be a complete, grammatical sentence
+- Start each point with a capital letter
+- End each point with proper punctuation (period, exclamation, etc.)
+- Keep points concise: 1-2 lines maximum
+- Use sub-points (indented with - or •) for detailed explanations within a main point
+- Numbered lists for sequential steps: 1., 2., 3.
+- Bulleted lists for non-sequential items: • or -
+
+HEADINGS:
+- Use headings (## Heading) to organize sections when needed
+- Examples: "## Dashboard Components", "## How to Make a Prediction", "## Available Pages"
+
+EMOJIS (OPTIONAL, USE SPARINGLY):
+- Use emojis only at the start of a response or key sections (max 1-2 per response)
+- 🚴 for bike-related topics
+- 📊 for dashboard/analytics
+- 🌦️ for weather
+- ✅ for confirmations
+- 💡 for tips
+
+RESPONSE EXAMPLES:
+
+Example 1 - Greeting:
+"Hi! 👋 I'm RideWise Assistant.
+
+• I can help you understand bike-sharing demand predictions
+• I know about all pages, features, and your prediction history
+• Ask me anything about RideWise!
+
+How can I help you today?"
+
+Example 2 - Feature Explanation:
+"## Dashboard Features
+
+The Dashboard page includes:
+
+• Summary Cards
+  - Show predicted demand, weather impact, and peak status
+  - Update automatically with your latest predictions
+
+• Demand Line Chart
+  - Visualizes bike demand trends over time
+  - Interactive data points for detailed analysis
+
+• Weather Bar Chart
+  - Shows demand distribution by weather conditions
+  - Helps identify weather impact patterns
+
+• Insights Panel
+  - Provides analytical insights about usage patterns
+  - Updates every 10 seconds automatically"
+
+Example 3 - Step-by-Step Guide:
+"## How to Make a Prediction
+
+Follow these steps:
+
+1. Navigate to the Prediction page from the main menu
+2. Choose between hourly or daily prediction mode using the toggle
+3. Enter required fields:
+   - Date (dteday)
+   - Season (spring/summer/fall/winter)
+   - Hour (0-23 for hourly mode)
+   - Weather condition
+   - Temperature and humidity
+   - Working day status
+4. Click the 'Predict Demand' button
+5. View the predicted bike demand displayed below the form"
+
+Example 4 - Definition with Points:
+"## Prediction Page
+
+The Prediction page allows you to make bike demand forecasts.
+
+• Purpose: Forecast bike rental demand using ML models
+• Modes: Supports both hourly and daily predictions
+• Inputs: Weather, temperature, humidity, and temporal factors
+• Output: Predicted number of bikes needed
+
+You can switch between hourly and daily modes using the toggle."
+
+CRITICAL RULES:
+- NEVER write paragraphs longer than 2 lines
+- ALWAYS break content into numbered or bulleted points
+- Use headings to organize when explaining multiple topics
+- Keep each point to 1-2 lines maximum
+- Use sub-points for detailed explanations within main points
+- Maintain logical flow: definition → explanation → example
+- Use simple, professional language suitable for students and developers"""
+
+# In-memory chat history
+chat_history = []
+
+
+def _get_fallback_response(user_msg_lower, context_info):
+    """Generate fallback response when API quota is exceeded."""
+    # Common greetings
+    if any(greeting in user_msg_lower for greeting in ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening']):
+        return """Hi! 👋 I'm RideWise Assistant.
+
+• I'm experiencing high demand right now
+• I can still help you with basic information about RideWise
+• Try again in a few minutes for full functionality
+
+How can I help you?"""
+    
+    # Questions about pages
+    if 'dashboard' in user_msg_lower:
+        return """## Dashboard Page
+
+The Dashboard shows real-time bike-sharing demand analytics.
+
+• Summary Cards
+  - Display predicted demand, weather impact, and peak status
+  - Update with your latest prediction results
+
+• Demand Line Chart
+  - Visualizes bike demand trends over time
+  - Interactive data points for analysis
+
+• Weather Bar Chart
+  - Shows demand distribution by weather conditions
+  - Helps identify weather impact patterns
+
+• Insights Panel
+  - Provides analytical insights about usage patterns
+  - Updates every 10 seconds automatically
+
+Access: Navigation menu or /dashboard"""
+    
+    if 'prediction' in user_msg_lower and 'page' in user_msg_lower or 'how' in user_msg_lower and 'predict' in user_msg_lower:
+        return """## How to Make a Prediction
+
+Follow these steps:
+
+1. Navigate to the Prediction page from the main menu
+2. Choose hourly or daily prediction mode using the toggle
+3. Fill in required fields:
+   - Date (dteday)
+   - Season (spring/summer/fall/winter)
+   - Hour (0-23 for hourly mode)
+   - Weather condition
+   - Temperature and humidity
+   - Working day status
+4. Click the 'Predict Demand' button
+5. View the predicted bike demand below the form
+
+The page supports both hourly and daily prediction modes."""
+    
+    if 'upload' in user_msg_lower or 'file' in user_msg_lower:
+        return """## Upload Page
+
+Enables file-based predictions.
+
+## Steps to Upload and Predict:
+
+1. Go to the Upload page from the navigation menu
+2. Click the file input and select a .txt file
+3. File format: key-value pairs like 'temp:25', 'hum:60', 'weather:1'
+4. Choose prediction mode: Auto-detect, Hourly, or Daily
+5. Click 'Upload and Predict' to process
+6. Result redirects to Prediction page with forecast
+
+Accepted format: .txt files with key:value pairs"""
+    
+    if 'chatbot' in user_msg_lower or 'chat' in user_msg_lower:
+        return """## Chatbot Page
+
+Provides AI assistance for RideWise.
+
+• Ask questions about any page, feature, or process
+• Has access to your prediction history and current state
+• Type your question and click send or press Enter
+• Helps with navigation, feature explanations, and predictions
+
+You're currently using the Chatbot page!"""
+    
+    if 'profile' in user_msg_lower:
+        return """## Profile Page
+
+Displays user information and project details.
+
+• User Information
+  - Shows your name, email, and avatar
+
+• Project Details
+  - Provides information about the RideWise project
+
+• Reviews Section
+  - Displays user reviews and feedback
+
+Access: Navigation menu or /profile"""
+    
+    if 'feature' in user_msg_lower or 'what can' in user_msg_lower:
+        return """## RideWise Features
+
+Key features available:
+
+• 📊 Dashboard
+  - Real-time analytics and insights visualization
+  - Charts and summary cards
+
+• 🎯 Prediction
+  - Make hourly or daily bike demand forecasts
+  - Uses weather and temporal data
+
+• 📁 Upload
+  - Predict from uploaded CSV or TXT files
+  - Supports batch predictions
+
+• 💬 Chatbot
+  - Get instant help and answers
+  - You're using it now!
+
+• 👤 Profile
+  - View user information and project details
+
+All features accessible from the main navigation menu"""
+    
+    if 'history' in user_msg_lower or 'past prediction' in user_msg_lower:
+        # Try to get actual history from context
+        if 'prediction history' in context_info.lower() or 'total of' in context_info.lower():
+            # Extract history info from context
+            lines = context_info.split('\n')
+            history_lines = [l for l in lines if 'prediction history' in l.lower() or 'total of' in l.lower() or 'ID' in l]
+            if history_lines:
+                return "## Your Prediction History\n\n" + "\n".join(["• " + l.strip() for l in history_lines[:5] if l.strip()])
+        return """## Prediction History
+
+Your prediction history stores all predictions you've made.
+
+• View by asking about specific predictions
+• Check the dashboard for recent results
+• All predictions are tracked automatically"""
+    
+    # Default fallback
+    return """## RideWise Information
+
+I'm experiencing high API demand, but here's what I can tell you:
+
+• Pages available:
+  - Dashboard, Prediction, Upload, Chatbot, and Profile
+
+• Key capabilities:
+  - Make predictions using weather and time data
+  - View analytics and insights on Dashboard
+  - Upload files for batch predictions
+
+• Next steps:
+  - Try again in a few minutes when API quota resets
+  - Check application pages directly for features"""
+
+
+def _get_application_context():
+    """Get comprehensive application state and information for chatbot context."""
+    context_parts = []
+    
+    # ============================================================================
+    # APPLICATION STRUCTURE AND PAGES
+    # ============================================================================
+    context_parts.append("=== RIDEWISE APPLICATION STRUCTURE ===")
+    context_parts.append("\nPAGES AND NAVIGATION:")
+    context_parts.append("• Login Page (/login): User authentication page where users log in with email and password.")
+    context_parts.append("• Signup Page (/signup): Registration page for new users to create an account.")
+    context_parts.append("• Dashboard (/dashboard): Main analytics page showing real-time bike-sharing demand insights.")
+    context_parts.append("• Prediction Page (/prediction): Interactive form to make hourly or daily bike demand predictions.")
+    context_parts.append("• Upload Page (/upload): File upload interface for making predictions from CSV or TXT files.")
+    context_parts.append("• Chatbot Page (/chatbot): AI assistant page where users can ask questions about the application.")
+    context_parts.append("• Profile Page (/profile): User profile page showing user information and project details.")
+    context_parts.append("• Root (/): Automatically redirects to dashboard if authenticated, otherwise to login.")
+    
+    context_parts.append("\n=== DASHBOARD PAGE DETAILS ===")
+    context_parts.append("The Dashboard page displays the following components:")
+    context_parts.append("• Summary Cards: Show predicted demand, prediction type, weather impact, and peak status.")
+    context_parts.append("• Demand Line Chart: Visualizes bike demand trends over time.")
+    context_parts.append("• Weather Bar Chart: Shows distribution of bike demand by weather conditions.")
+    context_parts.append("• Insights Panel: Provides analytical insights about bike-sharing patterns.")
+    context_parts.append("• About Section: Explains what RideWise is and its features.")
+    context_parts.append("• Recent Reviews: Displays recent user reviews and feedback.")
+    context_parts.append("• Auto-refresh: Dashboard data refreshes every 10 seconds automatically.")
+    context_parts.append("• Data Source: Fetches from /dashboard/summary API endpoint.")
+    
+    context_parts.append("\n=== PREDICTION PAGE DETAILS ===")
+    context_parts.append("The Prediction page allows users to make bike demand forecasts:")
+    context_parts.append("• Mode Toggle: Switch between Hourly and Daily prediction modes.")
+    context_parts.append("• Input Fields: Date (dteday), Season (spring/summer/fall/winter), Hour (0-23 for hourly mode).")
+    context_parts.append("• Weather Options: Clear, Cloudy, Light Rain, Heavy Rain.")
+    context_parts.append("• Temperature: Input field for temperature value.")
+    context_parts.append("• Humidity: Input field for humidity percentage.")
+    context_parts.append("• Working Day: Yes/No toggle for working day status.")
+    context_parts.append("• Predict Button: Submits form data to /predict/hour or /predict/day endpoint.")
+    context_parts.append("• Result Display: Shows predicted bike demand value after successful prediction.")
+    context_parts.append("• Validation: Form validates all required fields before submission.")
+    context_parts.append("• Auto-fill: Can auto-populate from uploaded prediction data.")
+    
+    context_parts.append("\n=== UPLOAD PAGE DETAILS ===")
+    context_parts.append("The Upload page enables file-based predictions:")
+    context_parts.append("• File Selection: Accepts .txt files with key-value pair format.")
+    context_parts.append("• Mode Selection: Auto-detect, Hourly, or Daily prediction mode.")
+    context_parts.append("• File Format: TXT files with format 'key:value' pairs (e.g., 'temp:25', 'hum:60').")
+    context_parts.append("• Accepted Keys: hour (or hr), humidity (or hum), weather (or weathersit), working_day, temperature, season, holiday.")
+    context_parts.append("• Processing: File is sent to /upload-predict endpoint for processing.")
+    context_parts.append("• Result: Prediction result is stored in localStorage and redirected to Prediction page.")
+    context_parts.append("• Error Handling: Validates file type and provides error messages for invalid formats.")
+    
+    context_parts.append("\n=== CHATBOT PAGE DETAILS ===")
+    context_parts.append("The Chatbot page provides AI assistance:")
+    context_parts.append("• Chat Interface: Interactive chat window for user questions.")
+    context_parts.append("• Message Input: Text input field with send button.")
+    context_parts.append("• Message History: Displays conversation history with user and assistant messages.")
+    context_parts.append("• API Endpoint: Communicates with /chat endpoint for responses.")
+    context_parts.append("• Context Awareness: Chatbot has access to application state and prediction history.")
+    
+    context_parts.append("\n=== PROFILE PAGE DETAILS ===")
+    context_parts.append("The Profile page shows user information:")
+    context_parts.append("• User Information: Displays user name, email, and avatar.")
+    context_parts.append("• Project Details: Shows information about the RideWise project.")
+    context_parts.append("• Reviews Section: Displays user reviews and feedback.")
+    
+    context_parts.append("\n=== AUTHENTICATION SYSTEM ===")
+    context_parts.append("• Protected Routes: Dashboard, Prediction, Upload, Chatbot, and Profile require authentication.")
+    context_parts.append("• Authentication Context: Uses AuthContext for managing user session state.")
+    context_parts.append("• Auto-redirect: Unauthenticated users are redirected to login page.")
+    context_parts.append("• Session Management: User authentication state persists across page navigation.")
+    
+    # ============================================================================
+    # CURRENT APPLICATION STATE
+    # ============================================================================
+    context_parts.append("\n=== CURRENT APPLICATION STATE ===")
+    
+    # Get last prediction data
+    global last_prediction, prediction_history
+    if last_prediction and last_prediction.get("predicted_demand") is not None:
+        pred_type = last_prediction.get("prediction_type", "Unknown")
+        demand = last_prediction.get("predicted_demand", "N/A")
+        weather = last_prediction.get("weather_impact", "N/A")
+        peak = last_prediction.get("peak_status", "N/A")
+        timestamp = last_prediction.get("timestamp", "")
+        
+        context_parts.append(f"• Last Prediction: {pred_type} mode, predicted demand: {demand} bikes.")
+        context_parts.append(f"• Weather Impact: {weather}, Peak Status: {peak}.")
+        if timestamp:
+            context_parts.append(f"• Prediction Timestamp: {timestamp}.")
+    else:
+        context_parts.append("• No predictions made yet.")
+    
+    # Prediction history (last 10 predictions for context)
+    if prediction_history:
+        context_parts.append(f"\n• Prediction History: Total of {len(prediction_history)} predictions made.")
+        hourly_count = sum(1 for p in prediction_history if p.get('prediction_type') == 'Hourly')
+        daily_count = sum(1 for p in prediction_history if p.get('prediction_type') == 'Daily')
+        context_parts.append(f"• Breakdown: {hourly_count} hourly predictions, {daily_count} daily predictions.")
+        
+        if prediction_history:
+            avg_demand = sum(p.get('predicted_demand', 0) for p in prediction_history) / len(prediction_history)
+            context_parts.append(f"• Average Predicted Demand: {round(avg_demand, 2)} bikes.")
+        
+        context_parts.append("\nRecent Predictions (Last 10):")
+        recent_predictions = prediction_history[-10:]  # Last 10 predictions
+        for pred in recent_predictions:
+            pred_str = f"  - ID {pred['id']}: {pred['prediction_type']} prediction"
+            if pred['prediction_type'] == 'Hourly':
+                pred_str += f" for hour {pred.get('hour', 'N/A')}"
+            pred_str += f" on {pred.get('date', 'N/A')}"
+            pred_str += f" - Predicted {pred['predicted_demand']} bikes"
+            pred_str += f" (Weather: {pred.get('weather_impact', 'N/A')}, Peak: {pred.get('peak_status', 'N/A')})"
+            context_parts.append(pred_str)
+    else:
+        context_parts.append("\n• No prediction history available yet.")
+    
+    # ============================================================================
+    # TECHNICAL DETAILS
+    # ============================================================================
+    context_parts.append("\n=== TECHNICAL INFORMATION ===")
+    context_parts.append(f"• Models Status: Day model {'loaded' if day_model else 'not loaded'}, Hour model {'loaded' if hour_model else 'not loaded'}.")
+    context_parts.append(f"• Day Model Features: {len(day_expected_features)} expected features.")
+    context_parts.append(f"• Hour Model Features: {len(hour_expected_features)} expected features.")
+    
+    context_parts.append("\n=== API ENDPOINTS AVAILABLE ===")
+    context_parts.append("• GET /health: Health check and model status.")
+    context_parts.append("• POST /predict/day: Make daily bike demand prediction.")
+    context_parts.append("• POST /predict/hour: Make hourly bike demand prediction.")
+    context_parts.append("• POST /upload-predict: Upload file for prediction.")
+    context_parts.append("• GET /dashboard/summary: Get dashboard summary data.")
+    context_parts.append("• POST /chat: Send message to chatbot.")
+    context_parts.append("• GET /chat/status: Check chatbot availability.")
+    context_parts.append("• POST /chat/reset: Reset chat history.")
+    context_parts.append("• GET /predictions/history: Get prediction history.")
+    context_parts.append("• POST /feedback: Submit user feedback.")
+    context_parts.append("• GET /feedback: Get all feedback.")
+    context_parts.append("• POST /api/reviews: Submit user review.")
+    context_parts.append("• GET /api/reviews: Get user reviews.")
+    
+    context_parts.append("\n=== FEATURES SUMMARY ===")
+    context_parts.append("• Real-time Dashboard: Analytics and insights visualization.")
+    context_parts.append("• ML-Powered Predictions: Uses trained models for accurate forecasting.")
+    context_parts.append("• Dual Prediction Modes: Hourly and daily prediction options.")
+    context_parts.append("• Weather Integration: Considers temperature, humidity, and weather conditions.")
+    context_parts.append("• File Upload: Support for CSV and TXT file predictions.")
+    context_parts.append("• Prediction History: Stores and tracks all predictions made.")
+    context_parts.append("• AI Chatbot: Interactive assistant with context awareness.")
+    context_parts.append("• User Authentication: Secure login and session management.")
+    context_parts.append("• Feedback System: Users can submit reviews and feedback.")
+    
+    return "\n".join(context_parts)
+
+# Day model path
+DAY_MODEL_FILE = os.path.join(MODEL_DIR, 'best_day_model.pkl')
+
+# Hour model path
+HOUR_MODEL_FILE = os.path.join(MODEL_DIR, 'best_hour_model.pkl')
+
+
+def _safe_load_model(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        return load(path)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _load_day_model_and_features(path):
+    model = _safe_load_model(path)
+    if model is None:
+        print(f"Warning: Model not found at {path}, skipping.")
+        return None, []
+    if not hasattr(model, 'feature_names_in_'):
+        print(f"Warning: Model does not expose `feature_names_in_`, skipping.")
+        return None, []
+    features = list(model.feature_names_in_)
+    return model, features
+
+
+# Load day model at startup (source of truth: feature_names_in_)
+print("Loading day model from:", DAY_MODEL_FILE)
+day_model, day_expected_features = _load_day_model_and_features(DAY_MODEL_FILE)
+if day_model:
+    print(f"Day model loaded - expects {len(day_expected_features)} features")
+else:
+    print("Day model not loaded")
+
+# Load hour model at startup
+print("Loading hour model from:", HOUR_MODEL_FILE)
+hour_model, hour_expected_features = _load_day_model_and_features(HOUR_MODEL_FILE)
+if hour_model:
+    print(f"Hour model loaded - expects {len(hour_expected_features)} features")
+else:
+    print("Hour model not loaded")
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint - test backend connectivity."""
+    return jsonify({
+        'status': 'ok',
+        'day_model_loaded': day_model is not None,
+        'day_feature_count': len(day_expected_features),
+        'hour_model_loaded': hour_model is not None,
+        'hour_feature_count': len(hour_expected_features),
+        'chatbot_available': model is not None
+    }), 200
+
+
+@app.route('/chat/status', methods=['GET'])
+def chat_status():
+    """Check if chatbot is available."""
+    return jsonify({
+        "available": model is not None,
+        "message": "Chatbot is ready" if model is not None else "Chatbot is unavailable. Please configure GEMINI_API_KEY in backend/.env file."
+    }), 200
+
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    try:
+        # Check if model is available
+        if model is None:
+            logger.error("Gemini model is not initialized. Check GEMINI_API_KEY.")
+            return jsonify({
+                "error": "Chatbot is unavailable. Please configure GEMINI_API_KEY in backend/.env file. Get your API key from: https://makersuite.google.com/app/apikey"
+            }), 503
+
+        user_msg = request.json.get("message")
+        prediction_data = request.json.get("prediction_data")  # Get prediction data from frontend
+
+        if not user_msg or not user_msg.strip():
+            return jsonify({"error": "Message required"}), 400
+
+        user_msg = user_msg.strip()
+        user_msg_lower = user_msg.lower()
+
+        # Get current application context for dynamic responses
+        context_info = _get_application_context()
+        
+        # Add prediction data to context if available from frontend
+        if prediction_data:
+            pred_type = prediction_data.get('predictionType', 'Unknown')
+            pred_value = prediction_data.get('prediction', 'N/A')
+            pred_inputs = prediction_data.get('inputs', {})
+            timestamp = prediction_data.get('timestamp', '')
+            
+            context_info += f"\n=== CURRENT PREDICTION DATA (FROM FRONTEND) ==="
+            context_info += f"\n• Latest Prediction: {pred_type} mode, predicted demand: {pred_value} bikes."
+            if pred_inputs:
+                context_info += f"\n• Prediction Inputs: Date={pred_inputs.get('dteday', 'N/A')}, Season={pred_inputs.get('season', 'N/A')}, Weather={pred_inputs.get('weathersit', 'N/A')}, Temp={pred_inputs.get('temp', 'N/A')}, Humidity={pred_inputs.get('hum', 'N/A')}."
+            if timestamp:
+                context_info += f"\n• Prediction Timestamp: {timestamp}."
+            context_info += "\n"
+        
+        # Build chat history for Gemini API
+        # Gemini expects a list of message dicts with 'role' and 'parts'
+        contents = []
+        
+        # Add previous chat history
+        for msg in chat_history:
+            contents.append(msg)
+        
+        # Build context-aware prompt
+        context_prompt = ""
+        if not chat_history:
+            # First message - include full system prompt
+            context_prompt = f"{SYSTEM_PROMPT}\n\n"
+        
+        # Include comprehensive context for ANY question about the application
+        # This ensures chatbot can answer questions about any page, feature, or process
+        application_keywords = [
+            'dashboard', 'prediction', 'predict', 'upload', 'file', 'chatbot', 'profile', 'login', 'signup',
+            'page', 'pages', 'feature', 'features', 'how', 'what', 'where', 'when', 'which', 'why',
+            'data', 'statistics', 'analytics', 'current', 'latest', 'recent', 'show', 'tell', 'explain',
+            'history', 'past', 'previous', 'list', 'all', 'navigation', 'menu', 'route', 'endpoint',
+            'form', 'input', 'button', 'chart', 'graph', 'summary', 'insight', 'review', 'feedback',
+            'authenticate', 'login', 'logout', 'session', 'user', 'account', 'mode', 'hourly', 'daily',
+            'weather', 'temperature', 'humidity', 'season', 'working', 'holiday', 'step', 'process',
+            'work', 'does', 'function', 'help', 'guide', 'tutorial', 'instruction', 'available'
+        ]
+        
+        # Always include context for questions - gives chatbot full application knowledge
+        # Only skip on simple greetings to save tokens
+        if not any(greeting in user_msg_lower for greeting in ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening']):
+            context_prompt += f"\nCOMPREHENSIVE APPLICATION INFORMATION:\n{context_info}\n\n"
+        elif any(keyword in user_msg_lower for keyword in application_keywords):
+            context_prompt += f"\nCOMPREHENSIVE APPLICATION INFORMATION:\n{context_info}\n\n"
+        
+        # Add current user message
+        if context_prompt:
+            contents.append({"role": "user", "parts": [f"{context_prompt}User: {user_msg}"]})
+        else:
+            contents.append({"role": "user", "parts": [user_msg]})
+
+        # Call Gemini API
+        try:
+            response = model.generate_content(contents)
+            
+            # Extract text from response
+            if hasattr(response, 'text'):
+                bot_reply = response.text
+            elif hasattr(response, 'candidates') and response.candidates:
+                if hasattr(response.candidates[0].content, 'parts'):
+                    bot_reply = response.candidates[0].content.parts[0].text
+                else:
+                    bot_reply = str(response.candidates[0].content)
+            else:
+                bot_reply = "Sorry, I couldn't generate a response. Please try again."
+            
+            # Save to history (only save the actual user message and response, not system prompt)
+            # Use original user message (not lowercase version)
+            chat_history.append({"role": "user", "parts": [user_msg]})
+            chat_history.append({"role": "model", "parts": [bot_reply]})
+            
+            logger.info("Chat response generated successfully")
+            return jsonify({"reply": bot_reply})
+            
+        except Exception as api_error:
+            logger.exception(f"Gemini API call failed: {api_error}")
+            error_msg = str(api_error)
+            # Provide more helpful error messages
+            if "API_KEY" in error_msg or "api key" in error_msg.lower():
+                return jsonify({
+                    "error": "API key is invalid or missing. Please check your configuration."
+                }), 503
+            elif "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                # Try fallback response for common questions
+                try:
+                    fallback_response = _get_fallback_response(user_msg_lower, context_info)
+                    logger.info("Using fallback response due to API quota exceeded")
+                    # Save fallback response to history
+                    chat_history.append({"role": "user", "parts": [user_msg]})
+                    chat_history.append({"role": "model", "parts": [fallback_response]})
+                    return jsonify({"reply": fallback_response})
+                except Exception as fallback_error:
+                    logger.exception(f"Fallback response failed: {fallback_error}")
+                    return jsonify({
+                        "error": "API quota exceeded. The chatbot is experiencing high demand. Please try again in a few minutes. In the meantime, you can explore the Dashboard, Prediction, and Upload pages directly."
+                    }), 429
+            else:
+                return jsonify({
+                    "error": f"Failed to get response: {error_msg}"
+                }), 500
+
+    except Exception as e:
+        logger.exception(f"Chat endpoint error: {e}")
+        return jsonify({
+            "error": "Chatbot is temporarily unavailable. Please try again later."
+        }), 500
+
+
+@app.route('/chat/reset', methods=['POST'])
+def reset_chat():
+    """Reset chat history endpoint."""
+    try:
+        global chat_history
+        chat_history = []
+        logger.info("Chat history reset")
+        return jsonify({"status": "success", "message": "Chat history cleared"}), 200
+    except Exception as e:
+        logger.exception(f"Reset chat error: {e}")
+        return jsonify({"error": "Failed to reset chat history"}), 500
+
+
+@app.route('/predictions/history', methods=['GET'])
+def get_prediction_history():
+    """Get prediction history endpoint."""
+    try:
+        global prediction_history
+        # Get query parameters for filtering
+        limit = request.args.get('limit', type=int)
+        pred_type = request.args.get('type')  # 'Hourly' or 'Daily'
+        
+        history = prediction_history.copy()
+        
+        # Filter by type if specified
+        if pred_type:
+            history = [p for p in history if p.get('prediction_type') == pred_type]
+        
+        # Reverse to show most recent first
+        history.reverse()
+        
+        # Apply limit if specified
+        if limit and limit > 0:
+            history = history[:limit]
+        
+        return jsonify({
+            "total": len(prediction_history),
+            "returned": len(history),
+            "predictions": history
+        }), 200
+    except Exception as e:
+        logger.exception(f"Get prediction history error: {e}")
+        return jsonify({"error": "Failed to retrieve prediction history"}), 500
+
+
+# Allowed UI inputs (exactly these 8)
+DAY_UI_FIELDS = ['dteday', 'season', 'holiday', 'workingday', 'weathersit', 'temp', 'atemp', 'hum']
+
+
+@app.route('/predict/day', methods=['POST', 'OPTIONS'])
+def predict_day():
+    """
+    Day-level prediction endpoint.
+
+    Strict behavior:
+    - Accept only the 8 UI inputs listed in `DAY_UI_FIELDS`.
+    - Compute date-derived features (yr, mnth, weekday, quarter, is_weekend).
+    - Compute cyclical features for month and weekday.
+    - Compute derived features: is_peak_season, temp_humidity, temp_windspeed (0), weather_severity.
+    - Remove raw `dteday` and reindex strictly to `day_expected_features`.
+    - Return JSON: { "prediction": value }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        payload = request.get_json(force=True)
+        print("\n[/predict/day] Received payload:", payload)
+
+        if not payload:
+            return jsonify({'error': 'No JSON body provided'}), 400
+
+        # Enforce UI inputs only
+        inputs = {k: payload.get(k) for k in DAY_UI_FIELDS}
+
+        # Verify required fields present (treat empty string as missing)
+        missing = [k for k, v in inputs.items() if v is None or (isinstance(v, str) and v.strip() == "")] 
+        if missing:
+            return jsonify({'error': f'Missing required inputs: {missing}'}), 400
+
+        # Store values needed for dashboard update
+        weathersit_val = inputs.get('weathersit', '1')
+        
+        # Build DataFrame from inputs
+        df = pd.DataFrame([inputs])
+
+        # Parse and derive date features
+        try:
+            dt = pd.to_datetime(df.at[0, 'dteday'])
+        except Exception as e:
+            return jsonify({'error': f'Invalid dteday format: {e}'}), 400
+
+        # Mandatory date-derived features
+        df['yr'] = dt.year
+        df['mnth'] = dt.month
+        df['weekday'] = dt.weekday()
+        df['quarter'] = (dt.month - 1) // 3 + 1
+        df['is_weekend'] = 1 if df.at[0, 'weekday'] >= 5 else 0
+
+        # Cyclical encodings (day model expects these if present in feature list)
+        df['mnth_sin'] = np.sin(2 * np.pi * df['mnth'] / 12)
+        df['mnth_cos'] = np.cos(2 * np.pi * df['mnth'] / 12)
+        df['weekday_sin'] = np.sin(2 * np.pi * df['weekday'] / 7)
+        df['weekday_cos'] = np.cos(2 * np.pi * df['weekday'] / 7)
+
+        # Derived features
+        df['is_peak_season'] = 1 if int(df.at[0, 'mnth']) in (6, 7, 8) else 0
+        # temp_humidity (temp * hum)
+        df['temp_humidity'] = pd.to_numeric(df['temp'], errors='coerce') * pd.to_numeric(df['hum'], errors='coerce')
+        # temp_windspeed: not provided in day UI, set to 0 as required
+        df['temp_windspeed'] = 0
+        # weather_severity mirrors weathersit
+        df['weather_severity'] = df['weathersit']
+
+        # Remove raw dteday before prediction
+        df = df.drop(columns=['dteday'])
+
+        # Ensure numeric columns are properly typed
+        numeric_cols = ['season', 'holiday', 'workingday', 'weathersit', 'temp', 'atemp', 'hum',
+                        'yr', 'mnth', 'weekday', 'quarter', 'is_weekend',
+                        'mnth_sin', 'mnth_cos', 'weekday_sin', 'weekday_cos',
+                        'is_peak_season', 'temp_humidity', 'temp_windspeed', 'weather_severity']
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
+        # Reindex strictly to expected features (only source of truth)
+        df_reindexed = df.reindex(columns=day_expected_features, fill_value=0)
+
+        if len(df_reindexed.columns) != len(day_expected_features):
+            return jsonify({'error': f'Feature alignment error: prepared {len(df_reindexed.columns)} features, expected {len(day_expected_features)}'}), 500
+
+        # Prediction
+        try:
+            X = df_reindexed.values
+            preds = day_model.predict(X)
+            pred_value = float(preds[0])
+            pred_value = max(0.0, pred_value)
+            print(f"[/predict/day] Prediction: {pred_value}")
+            
+            # Update dashboard summary (in-memory)
+            from datetime import datetime
+            global last_prediction, prediction_history
+            
+            timestamp = datetime.now()
+            prediction_entry = {
+                "id": len(prediction_history) + 1,
+                "predicted_demand": round(pred_value, 2),
+                "prediction_type": "Daily",
+                "date": inputs.get('dteday', 'N/A'),
+                "season": inputs.get('season', 'N/A'),
+                "weathersit": weathersit_val,
+                "weather_impact": _calculate_weather_impact(weathersit_val),
+                "temp": inputs.get('temp', 'N/A'),
+                "hum": inputs.get('hum', 'N/A'),
+                "workingday": inputs.get('workingday', 'N/A'),
+                "holiday": inputs.get('holiday', 'N/A'),
+                "peak_status": _calculate_peak_status(demand=int(pred_value)),
+                "timestamp": timestamp.isoformat(),
+                "date_readable": timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            last_prediction = {
+                "predicted_demand": round(pred_value, 2),
+                "prediction_type": "Daily",
+                "weather_impact": prediction_entry["weather_impact"],
+                "peak_status": prediction_entry["peak_status"],
+                "timestamp": timestamp.isoformat()
+            }
+            
+            # Add to prediction history
+            prediction_history.append(prediction_entry)
+            # Keep only last 100 predictions to avoid memory issues
+            if len(prediction_history) > 100:
+                prediction_history.pop(0)
+            
+            return jsonify({'prediction': round(pred_value, 2)}), 200
+        except Exception as e:
+            print(f"[/predict/day] Model prediction error: {e}")
+            traceback.print_exc()
+            return jsonify({'error': f'Prediction failed: {e}'}), 500
+
+    except Exception as e:
+        print(f"[/predict/day] Unexpected error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+
+# Allowed UI inputs for HOUR model (no windspeed - derived by backend)
+HOUR_UI_FIELDS = ['dteday', 'hr', 'season', 'holiday', 'workingday', 'weathersit', 'temp', 'atemp', 'hum']
+
+
+@app.route('/predict/hour', methods=['POST', 'OPTIONS'])
+def predict_hour():
+    """
+    Hour-level prediction endpoint.
+
+    Strict behavior:
+    - Accept only the 10 UI inputs listed in `HOUR_UI_FIELDS`.
+    - Compute date-derived features (yr, mnth, weekday, quarter, is_weekend) from dteday.
+    - Compute cyclical features for month, weekday, and hour if expected by model.
+    - Compute derived features: is_peak_season, temp_humidity, temp_windspeed, weather_severity.
+    - Remove raw `dteday` and reindex strictly to `hour_expected_features`.
+    - Return JSON: { "prediction": value }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        payload = request.get_json(force=True)
+        print("\n[/predict/hour] Received payload:", payload)
+
+        if not payload:
+            return jsonify({'error': 'No JSON body provided'}), 400
+
+        # Enforce UI inputs only
+        inputs = {k: payload.get(k) for k in HOUR_UI_FIELDS}
+
+        # Verify required fields present (treat empty string as missing)
+        missing = [k for k, v in inputs.items() if v is None or (isinstance(v, str) and v.strip() == "")] 
+        if missing:
+            return jsonify({'error': f'Missing required inputs: {missing}'}), 400
+
+        # Store values needed for dashboard update
+        weathersit_val = inputs.get('weathersit', '1')
+        hr_val = int(inputs.get('hr', 0))
+        
+        # Build DataFrame from inputs
+        df = pd.DataFrame([inputs])
+
+        # Parse and derive date features
+        try:
+            dt = pd.to_datetime(df.at[0, 'dteday'])
+        except Exception as e:
+            return jsonify({'error': f'Invalid dteday format: {e}'}), 400
+
+        # Mandatory date-derived features
+        df['yr'] = dt.year
+        df['mnth'] = dt.month
+        df['weekday'] = dt.weekday()
+        df['quarter'] = (dt.month - 1) // 3 + 1
+        df['is_weekend'] = 1 if df.at[0, 'weekday'] >= 5 else 0
+
+        # Cyclical encodings for hour model
+        df['mnth_sin'] = np.sin(2 * np.pi * df['mnth'] / 12)
+        df['mnth_cos'] = np.cos(2 * np.pi * df['mnth'] / 12)
+        df['weekday_sin'] = np.sin(2 * np.pi * df['weekday'] / 7)
+        df['weekday_cos'] = np.cos(2 * np.pi * df['weekday'] / 7)
+        
+        # Hour cyclical encoding (if expected by model)
+        hr_numeric = pd.to_numeric(df['hr'], errors='coerce').fillna(0).astype(int)
+        df['hr_sin'] = np.sin(2 * np.pi * hr_numeric / 24)
+        df['hr_cos'] = np.cos(2 * np.pi * hr_numeric / 24)
+
+        # Derived features
+        df['is_peak_season'] = 1 if int(df.at[0, 'mnth']) in (6, 7, 8) else 0
+        # temp_humidity (temp * hum)
+        df['temp_humidity'] = pd.to_numeric(df['temp'], errors='coerce') * pd.to_numeric(df['hum'], errors='coerce')
+        # temp_windspeed: not provided in hour UI, set to 0 as required
+        df['windspeed'] = 0
+        df['temp_windspeed'] = pd.to_numeric(df['temp'], errors='coerce') * 0
+        # weather_severity mirrors weathersit
+        df['weather_severity'] = df['weathersit']
+
+        # Remove raw dteday before prediction
+        df = df.drop(columns=['dteday'])
+
+        # Ensure numeric columns are properly typed
+        numeric_cols = ['season', 'holiday', 'workingday', 'weathersit', 'temp', 'atemp', 'hum', 'windspeed', 'hr',
+                        'yr', 'mnth', 'weekday', 'quarter', 'is_weekend',
+                        'mnth_sin', 'mnth_cos', 'weekday_sin', 'weekday_cos', 'hr_sin', 'hr_cos',
+                        'is_peak_season', 'temp_humidity', 'temp_windspeed', 'weather_severity']
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
+        # Reindex strictly to expected features (only source of truth)
+        df_reindexed = df.reindex(columns=hour_expected_features, fill_value=0)
+
+        if len(df_reindexed.columns) != len(hour_expected_features):
+            return jsonify({'error': f'Feature alignment error: prepared {len(df_reindexed.columns)} features, expected {len(hour_expected_features)}'}), 500
+
+        # Prediction
+        try:
+            X = df_reindexed.values
+            preds = hour_model.predict(X)
+            pred_value = float(preds[0])
+            pred_value = max(0.0, pred_value)
+            print(f"[/predict/hour] Prediction: {pred_value}")
+            
+            # Update dashboard summary (in-memory)
+            from datetime import datetime
+            global last_prediction, prediction_history
+            
+            timestamp = datetime.now()
+            prediction_entry = {
+                "id": len(prediction_history) + 1,
+                "predicted_demand": round(pred_value, 2),
+                "prediction_type": "Hourly",
+                "date": inputs.get('dteday', 'N/A'),
+                "hour": hr_val,
+                "season": inputs.get('season', 'N/A'),
+                "weathersit": weathersit_val,
+                "weather_impact": _calculate_weather_impact(weathersit_val),
+                "temp": inputs.get('temp', 'N/A'),
+                "hum": inputs.get('hum', 'N/A'),
+                "workingday": inputs.get('workingday', 'N/A'),
+                "holiday": inputs.get('holiday', 'N/A'),
+                "peak_status": _calculate_peak_status(hour=hr_val, demand=int(pred_value)),
+                "timestamp": timestamp.isoformat(),
+                "date_readable": timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            last_prediction = {
+                "predicted_demand": round(pred_value, 2),
+                "prediction_type": "Hourly",
+                "weather_impact": prediction_entry["weather_impact"],
+                "peak_status": prediction_entry["peak_status"],
+                "timestamp": timestamp.isoformat()
+            }
+            
+            # Add to prediction history
+            prediction_history.append(prediction_entry)
+            # Keep only last 100 predictions to avoid memory issues
+            if len(prediction_history) > 100:
+                prediction_history.pop(0)
+            
+            return jsonify({'prediction': round(pred_value, 2)}), 200
+        except Exception as e:
+            print(f"[/predict/hour] Model prediction error: {e}")
+            traceback.print_exc()
+            return jsonify({'error': f'Prediction failed: {e}'}), 500
+
+    except Exception as e:
+        print(f"[/predict/hour] Unexpected error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/predict/upload', methods=['POST'])
+def predict_upload():
+    """
+    POST endpoint for file upload prediction.
+    
+    Accepts multipart/form-data with 'file' field.
+    Supports .csv files with weather data.
+    Uses first row for prediction.
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Validate file extension
+        if not file.filename.lower().endswith(('.csv', '.txt')):
+            return jsonify({'error': 'Invalid file type. Only .csv and .txt files are supported'}), 400
+        
+        if file.filename.lower().endswith('.txt'):
+            return jsonify({'error': 'TXT format supported only for structured key:value data'}), 400
+        
+        # Read CSV file
+        try:
+            df = pd.read_csv(file)
+            if df.empty:
+                return jsonify({'error': 'CSV file is empty'}), 400
+            
+            # Use only first row
+            row = df.iloc[0]
+            
+            # Extract required columns
+            required_cols = ['temp', 'hum', 'weathersit', 'workingday']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                return jsonify({'error': f'Missing required columns: {missing_cols}'}), 400
+            
+            # Build inputs dict
+            inputs = {
+                'dteday': '2024-01-01',  # Dummy date
+                'season': 1,  # Default season
+                'holiday': 0,  # Default
+                'workingday': int(row['workingday']),
+                'weathersit': int(row['weathersit']),
+                'temp': float(row['temp']),
+                'atemp': float(row['temp']),  # Use temp if atemp not available
+                'hum': float(row['hum'])
+            }
+            
+            # Optional windspeed
+            if 'windspeed' in df.columns:
+                inputs['windspeed'] = float(row['windspeed'])
+            
+        except Exception as e:
+            return jsonify({'error': f'Error parsing CSV file: {str(e)}'}), 400
+        
+        # Build DataFrame from inputs
+        df_pred = pd.DataFrame([inputs])
+        
+        # Parse and derive date features
+        try:
+            dt = pd.to_datetime(df_pred.at[0, 'dteday'])
+        except Exception as e:
+            return jsonify({'error': f'Invalid dteday format: {e}'}), 400
+        
+        # Mandatory date-derived features
+        df_pred['yr'] = dt.year
+        df_pred['mnth'] = dt.month
+        df_pred['weekday'] = dt.weekday()
+        df_pred['quarter'] = (dt.month - 1) // 3 + 1
+        df_pred['is_weekend'] = 1 if df_pred.at[0, 'weekday'] >= 5 else 0
+        
+        # Cyclical encodings
+        df_pred['mnth_sin'] = np.sin(2 * np.pi * df_pred['mnth'] / 12)
+        df_pred['mnth_cos'] = np.cos(2 * np.pi * df_pred['mnth'] / 12)
+        df_pred['weekday_sin'] = np.sin(2 * np.pi * df_pred['weekday'] / 7)
+        df_pred['weekday_cos'] = np.cos(2 * np.pi * df_pred['weekday'] / 7)
+        
+        # Derived features
+        df_pred['is_peak_season'] = 1 if int(df_pred.at[0, 'mnth']) in (6, 7, 8) else 0
+        df_pred['temp_humidity'] = pd.to_numeric(df_pred['temp'], errors='coerce') * pd.to_numeric(df_pred['hum'], errors='coerce')
+        df_pred['temp_windspeed'] = 0  # Set to 0 as per day model requirements
+        df_pred['weather_severity'] = df_pred['weathersit']
+        
+        # Remove raw dteday before prediction
+        df_pred = df_pred.drop(columns=['dteday'])
+        
+        # Ensure numeric columns are properly typed
+        numeric_cols = ['season', 'holiday', 'workingday', 'weathersit', 'temp', 'atemp', 'hum',
+                        'yr', 'mnth', 'weekday', 'quarter', 'is_weekend',
+                        'mnth_sin', 'mnth_cos', 'weekday_sin', 'weekday_cos',
+                        'is_peak_season', 'temp_humidity', 'temp_windspeed', 'weather_severity']
+        for c in numeric_cols:
+            if c in df_pred.columns:
+                df_pred[c] = pd.to_numeric(df_pred[c], errors='coerce').fillna(0)
+        
+        # Reindex strictly to expected features
+        df_reindexed = df_pred.reindex(columns=day_expected_features, fill_value=0)
+        
+        if len(df_reindexed.columns) != len(day_expected_features):
+            return jsonify({'error': f'Feature alignment error: prepared {len(df_reindexed.columns)} features, expected {len(day_expected_features)}'}), 500
+        
+        # Prediction
+        try:
+            X = df_reindexed.values
+            preds = day_model.predict(X)
+            pred_value = float(preds[0])
+            pred_value = max(0.0, pred_value)
+            
+            return jsonify({
+                'predicted_demand': round(pred_value, 2),
+                'source': 'file_upload'
+            }), 200
+        except Exception as e:
+            print(f"[/predict/upload] Model prediction error: {e}")
+            traceback.print_exc()
+            return jsonify({'error': f'Prediction failed: {e}'}), 500
+    
+    except Exception as e:
+        print(f"[/predict/upload] Unexpected error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/upload-predict', methods=['POST'])
+def predict_from_file():
+    if request.method == 'OPTIONS':
+        return '', 204
+    """
+    POST endpoint for TXT file upload prediction with mode selection.
+    
+    Accepts multipart/form-data with 'file' (TXT only) and 'mode' ("hour" or "day").
+    Parses key:value pairs from TXT file.
+    - Date fields (dteday) remain as strings
+    - Yes/no values converted to 0/1 for workingday
+    - hour = -1 triggers daily prediction
+    - Only numeric fields are converted to numeric
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Validate file extension (TXT only)
+        if not file.filename.lower().endswith('.txt'):
+            return jsonify({'error': 'Invalid file type. Only .txt files are supported'}), 400
+        
+        # Get mode from form data, default to auto
+        mode_param = request.form.get('mode', 'auto')
+        if mode_param not in ['auto', 'hour', 'day']:
+            return jsonify({'error': 'Invalid mode. Must be auto, hour, or day'}), 400
+        
+        # Parse TXT file
+        try:
+            content = file.read().decode('utf-8')
+            lines = content.strip().split('\n')
+            
+            # Key mapping for user-friendly names to model feature names
+            key_mapping = {
+                'hour': 'hr',
+                'humidity': 'hum',
+                'weather': 'weathersit',
+                'working_day': 'workingday',
+                'temperature': 'temp',
+                'season': 'season',
+                'holiday': 'holiday',
+                'workingday': 'workingday',
+                'windspeed': 'windspeed',
+                'atemp': 'atemp',
+                'date': 'dteday',
+                'dteday': 'dteday'
+            }
+            
+            # Fields that should remain as strings (date)
+            string_fields = {'dteday', 'date'}
+            
+            # Fields that should be converted from yes/no to 0/1
+            boolean_fields = {'workingday', 'working_day', 'holiday'}
+            
+            # Fields that must be numeric
+            numeric_fields = {'season', 'weathersit', 'weather', 'temp', 'temperature', 'atemp', 
+                            'hum', 'humidity', 'hr', 'hour', 'windspeed'}
+            
+            parsed_inputs = {}
+            raw_inputs = {}  # Store raw values for return
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if ':' not in line:
+                    return jsonify({'error': f'Invalid TXT format. Line "{line}" must be in key:value format'}), 400
+                
+                key, value = line.split(':', 1)
+                key = key.strip().lower()  # Normalize to lowercase
+                value = value.strip()
+                
+                if not key or not value:
+                    return jsonify({'error': f'Invalid TXT format. Line "{line}" has empty key or value'}), 400
+                
+                # Map user-friendly keys to model keys
+                mapped_key = key_mapping.get(key, key)
+                raw_inputs[mapped_key] = value  # Store original value
+                
+                # Handle date field (keep as string)
+                if mapped_key == 'dteday' or key in string_fields:
+                    parsed_inputs[mapped_key] = value
+                    continue
+                
+                # Handle yes/no values for boolean fields
+                if mapped_key in boolean_fields or key in boolean_fields:
+                    value_lower = value.lower()
+                    if value_lower in ['yes', 'true', '1', 'y']:
+                        parsed_inputs[mapped_key] = 1
+                    elif value_lower in ['no', 'false', '0', 'n']:
+                        parsed_inputs[mapped_key] = 0
+                    else:
+                        return jsonify({'error': f'Invalid value for {key}. Expected yes/no or 0/1, got: {value}'}), 400
+                    continue
+                
+                # Convert numeric fields
+                try:
+                    num_value = float(value)
+                    # Convert to int if it's a whole number
+                    if num_value == int(num_value):
+                        num_value = int(num_value)
+                    parsed_inputs[mapped_key] = num_value
+                except ValueError:
+                    # If it's not numeric and not a special field, that's an error
+                    return jsonify({'error': f'Invalid numeric value for {key}: "{value}". Expected a number.'}), 400
+            
+            if not parsed_inputs:
+                return jsonify({'error': 'TXT file is empty or contains no valid key:value pairs'}), 400
+            
+            # Determine mode based on hour value
+            # hour == -1 means daily prediction
+            # hour >= 0 means hourly prediction
+            hr_value = parsed_inputs.get('hr', None)
+            
+            if mode_param == 'auto':
+                if hr_value is not None:
+                    if hr_value == -1:
+                        mode = 'day'
+                        # Remove hr for daily prediction
+                        parsed_inputs.pop('hr', None)
+                        raw_inputs.pop('hr', None)
+                    elif hr_value >= 0 and hr_value <= 23:
+                        mode = 'hour'
+                    else:
+                        return jsonify({'error': f'Invalid hour value: {hr_value}. Must be between 0-23 for hourly or -1 for daily'}), 400
+                else:
+                    mode = 'day'
+            else:
+                mode = mode_param
+                if mode == 'hour':
+                    if hr_value is None:
+                        return jsonify({'error': 'Hourly mode requires hour (hr) field in file'}), 400
+                    if hr_value == -1:
+                        return jsonify({'error': 'Hourly mode cannot use hour=-1. Use day mode or set hour between 0-23'}), 400
+                    if hr_value < 0 or hr_value > 23:
+                        return jsonify({'error': f'Invalid hour value: {hr_value}. Must be between 0-23'}), 400
+                elif mode == 'day':
+                    # Remove hr if present for day mode
+                    parsed_inputs.pop('hr', None)
+                    raw_inputs.pop('hr', None)
+            
+            # Validate required features based on mode
+            required_keys = ['temp', 'hum', 'weathersit']
+            if mode == 'hour':
+                required_keys.append('hr')
+            
+            missing_keys = [k for k in required_keys if k not in parsed_inputs]
+            if missing_keys:
+                return jsonify({'error': f'Missing required features for {mode} prediction: {missing_keys}. Please include these fields in your TXT file.'}), 400
+                
+        except Exception as e:
+            return jsonify({'error': f'Error parsing TXT file: {str(e)}'}), 400
+        
+        # Select model and features based on mode
+        if mode == 'hour':
+            model = hour_model
+            expected_features = hour_expected_features
+        else:  # day
+            model = day_model
+            expected_features = day_expected_features
+        
+        if model is None:
+            return jsonify({'error': f'{mode.capitalize()} model not loaded'}), 500
+        
+        # Get date from parsed inputs or use default
+        date_str = parsed_inputs.get('dteday', '2024-06-15')
+        
+        # Create DataFrame with parsed inputs (excluding dteday for now)
+        df_inputs = {k: v for k, v in parsed_inputs.items() if k != 'dteday'}
+        df = pd.DataFrame([df_inputs])
+        
+        # Parse date for derived features
+        try:
+            dt = pd.to_datetime(date_str)
+        except Exception as e:
+            return jsonify({'error': f'Invalid date format: "{date_str}". Expected YYYY-MM-DD format. Error: {str(e)}'}), 400
+        
+        # Mandatory date-derived features
+        df['yr'] = dt.year
+        df['mnth'] = dt.month
+        df['weekday'] = dt.weekday()
+        df['quarter'] = (dt.month - 1) // 3 + 1
+        df['is_weekend'] = 1 if df.at[0, 'weekday'] >= 5 else 0
+        
+        # Cyclical encodings
+        df['mnth_sin'] = np.sin(2 * np.pi * df['mnth'] / 12)
+        df['mnth_cos'] = np.cos(2 * np.pi * df['mnth'] / 12)
+        df['weekday_sin'] = np.sin(2 * np.pi * df['weekday'] / 7)
+        df['weekday_cos'] = np.cos(2 * np.pi * df['weekday'] / 7)
+        
+        # Derived features
+        df['is_peak_season'] = 1 if int(df.at[0, 'mnth']) in (6, 7, 8) else 0
+        df['temp_humidity'] = pd.to_numeric(df['temp'], errors='coerce') * pd.to_numeric(df['hum'], errors='coerce')
+        df['weather_severity'] = df['weathersit']
+        
+        if mode == 'hour':
+            # Hour cyclical encoding
+            hr_numeric = pd.to_numeric(df['hr'], errors='coerce').fillna(12)
+            df['hr_sin'] = np.sin(2 * np.pi * hr_numeric / 24)
+            df['hr_cos'] = np.cos(2 * np.pi * hr_numeric / 24)
+            df['windspeed'] = 0
+            df['temp_windspeed'] = pd.to_numeric(df['temp'], errors='coerce') * 0
+        else:
+            # For day mode, remove 'hr' if present
+            if 'hr' in df.columns:
+                df = df.drop(columns=['hr'])
+            df['temp_windspeed'] = 0
+        
+        # Ensure numeric columns are properly typed
+        numeric_cols = [col for col in df.columns if col in expected_features]
+        for c in numeric_cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+        
+        # Reindex to expected features, fill missing with 0
+        df_reindexed = df.reindex(columns=expected_features, fill_value=0)
+        
+        if len(df_reindexed.columns) != len(expected_features):
+            return jsonify({'error': 'Feature alignment error'}), 500
+        
+        # Prediction
+        try:
+            X = df_reindexed.values
+            preds = model.predict(X)
+            pred_value = float(preds[0])
+            pred_value = max(0.0, pred_value)
+            
+            return jsonify({
+                'mode': mode,
+                'parsed_inputs': parsed_inputs,
+                'prediction': round(pred_value, 2)
+            }), 200
+        except Exception as e:
+            print(f"[/predict/from-file] Model prediction error: {e}")
+            traceback.print_exc()
+            return jsonify({'error': f'Prediction failed: {e}'}), 500
+    
+    except Exception as e:
+        print(f"[/predict/from-file] Unexpected error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# IN-MEMORY STORAGE: Dashboard Summary & Feedback
+# ============================================================================
+
+# Track last prediction for dynamic dashboard
+last_prediction = {
+    "predicted_demand": None,
+    "prediction_type": None,
+    "weather_impact": None,
+    "peak_status": None,
+    "timestamp": None
+}
+
+# Store prediction history with full details
+prediction_history = []
+
+# Store user feedback (in-memory list)
+feedback_list = []
+
+# Store user reviews (in-memory dict: user_email -> list of reviews)
+reviews_db = {}
+
+# Load reviews from file if exists
+REVIEWS_FILE = os.path.join(BASE_DIR, 'reviews.json')
+if os.path.exists(REVIEWS_FILE):
+    try:
+        with open(REVIEWS_FILE, 'r') as f:
+            reviews_db = json.load(f)
+        print(f"[Reviews] Loaded {sum(len(reviews) for reviews in reviews_db.values())} reviews from {REVIEWS_FILE}")
+    except Exception as e:
+        print(f"[Reviews] Failed to load reviews from file: {e}")
+        reviews_db = {}
+
+def save_reviews():
+    """Save reviews to file"""
+    try:
+        with open(REVIEWS_FILE, 'w') as f:
+            json.dump(reviews_db, f, indent=2)
+    except Exception as e:
+        print(f"[Reviews] Failed to save reviews to file: {e}")
+
+# Store contact queries (list of queries)
+contact_queries = []
+
+# Load contact queries from file if exists
+CONTACTS_FILE = os.path.join(BASE_DIR, 'contact_queries.json')
+if os.path.exists(CONTACTS_FILE):
+    try:
+        with open(CONTACTS_FILE, 'r') as f:
+            contact_queries = json.load(f)
+        print(f"[Contact] Loaded {len(contact_queries)} contact queries from {CONTACTS_FILE}")
+    except Exception as e:
+        print(f"[Contact] Failed to load contact queries from file: {e}")
+        contact_queries = []
+
+def save_contact_queries():
+    """Save contact queries to file"""
+    try:
+        with open(CONTACTS_FILE, 'w') as f:
+            json.dump(contact_queries, f, indent=2)
+    except Exception as e:
+        print(f"[Contact] Failed to save contact queries to file: {e}")
+
+# Seed data for demo stations (used to serve /api/stations)
+# In production, replace with database-backed stations.
+STATION_SEED_DATA = [
+    {"station_id": "DEL-CP-01", "station_name": "Connaught Place, New Delhi", "lat": 28.6315, "lng": 77.2167, "base_bikes": 22},
+    {"station_id": "MUM-BKC-01", "station_name": "Bandra Kurla Complex, Mumbai", "lat": 19.0678, "lng": 72.8677, "base_bikes": 26},
+    {"station_id": "BLR-MG-01", "station_name": "MG Road, Bengaluru", "lat": 12.9738, "lng": 77.6092, "base_bikes": 24},
+    {"station_id": "HYD-HITECH-01", "station_name": "Hitech City, Hyderabad", "lat": 17.4474, "lng": 78.3762, "base_bikes": 28},
+    {"station_id": "CHN-TNGR-01", "station_name": "T Nagar, Chennai", "lat": 13.0418, "lng": 80.2337, "base_bikes": 20},
+    {"station_id": "PUN-HNGR-01", "station_name": "Hinjewadi, Pune", "lat": 18.5916, "lng": 73.7389, "base_bikes": 21},
+    {"station_id": "KOL-SALT-01", "station_name": "Salt Lake, Kolkata", "lat": 22.5800, "lng": 88.4090, "base_bikes": 23},
+    {"station_id": "AHM-SGR-01", "station_name": "SG Highway, Ahmedabad", "lat": 23.0451, "lng": 72.5247, "base_bikes": 18},
+]
+
+STATION_BY_ID = {s["station_id"]: s for s in STATION_SEED_DATA}
+
+def _derive_demand_level(available_bikes: int) -> str:
+    """Map available bikes to demand level (fewer bikes means higher demand)."""
+    if available_bikes < 10:
+        return "High"
+    if available_bikes < 20:
+        return "Medium"
+    return "Low"
+
+# In-memory reservation storage (no DB as requested)
+reservations = {}
+
+def _calculate_reservation_price(demand_level: str, time_slot: str) -> int:
+    """
+    Pricing rules:
+    - Base price: ₹200
+    - Demand pricing: Low ₹200, Medium ₹300, High ₹400
+    - Night surcharge: +₹100 if time_slot = Night
+    """
+    demand_prices = {"Low": 200, "Medium": 300, "High": 400}
+    base = demand_prices.get(demand_level, 200)
+    if time_slot == "Night":
+        base += 100
+    return int(base)
+
+def _generate_reservation_id() -> str:
+    """Generate a unique reservation ID like RW12345."""
+    # Simple uniqueness in-memory: retry if collision happens.
+    for _ in range(10):
+        rid = f"RW{random.randint(10000, 99999)}"
+        if all(r.get("reservation_id") != rid for r in reservations):
+            return rid
+    # Fallback: deterministic using length (still unique for in-memory run)
+    return f"RW{10000 + len(reservations)}"
+
+
+def _calculate_weather_impact(weathersit: str) -> str:
+    """Calculate weather impact level based on weather situation code."""
+    try:
+        code = int(weathersit)
+        if code == 1:
+            return "Low"      # Clear / Sunny
+        elif code == 2:
+            return "Medium"   # Cloudy / Misty
+        elif code == 3:
+            return "High"     # Light Rain / Snow
+        else:
+            return "High"     # Heavy Rain / Storm
+    except:
+        return "Medium"
+
+
+def _calculate_peak_status(hour: int = None, demand: int = None) -> str:
+    """Calculate peak status based on hour and demand level."""
+    if demand is None:
+        return "Normal"
+    
+    # Peak hours: 7-9 AM, 4-7 PM (high demand typical)
+    peak_hours = [7, 8, 9, 16, 17, 18, 19]
+    
+    if demand > 400:
+        return "Peak"
+    elif demand > 200:
+        return "Normal"
+    else:
+        return "Off-Peak"
+
+
+@app.route('/dashboard/summary', methods=['GET'])
+def get_dashboard_summary():
+    """
+    GET endpoint to retrieve the last prediction summary for dashboard.
+    
+    Returns:
+    {
+        "predicted_demand": number or null,
+        "prediction_type": "Hourly" or "Daily" or null,
+        "weather_impact": "Low" | "Medium" | "High" or null,
+        "peak_status": "Peak" | "Normal" | "Off-Peak" or null,
+        "timestamp": ISO string or null
+    }
+    """
+    return jsonify(last_prediction), 200
+
+
+@app.route('/feedback', methods=['POST', 'OPTIONS'])
+def submit_feedback():
+    """
+    POST endpoint to submit user feedback.
+    
+    Request body:
+    {
+        "rating": 1-5,
+        "comment": "feedback text"
+    }
+    
+    Returns:
+    {
+        "status": "success"
+    }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        payload = request.get_json(force=True)
+        
+        if not payload:
+            return jsonify({'error': 'No JSON body provided'}), 400
+        
+        # Validate required fields
+        rating = payload.get('rating')
+        comment = payload.get('comment', '').strip()
+        
+        if rating is None or not comment:
+            return jsonify({'error': 'Missing rating or comment'}), 400
+        
+        try:
+            rating = int(rating)
+            if rating < 1 or rating > 5:
+                return jsonify({'error': 'Rating must be between 1 and 5'}), 400
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Rating must be an integer'}), 400
+        
+        # Store feedback with timestamp
+        from datetime import datetime
+        feedback_entry = {
+            'rating': rating,
+            'comment': comment,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        feedback_list.append(feedback_entry)
+        print(f"[Feedback] Received: {rating}★ - {comment[:50]}...")
+        
+        return jsonify({'status': 'success'}), 201
+    
+    except Exception as e:
+        print(f"[Feedback] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/feedback', methods=['GET'])
+def get_feedback():
+    """
+    GET endpoint to retrieve all feedback entries.
+    
+    Returns:
+    {
+        "feedback": [
+            { "rating": 5, "comment": "...", "timestamp": "..." },
+            ...
+        ]
+    }
+    """
+    return jsonify({'feedback': feedback_list}), 200
+
+
+@app.route('/api/contact', methods=['POST', 'OPTIONS'])
+def contact_api():
+    """
+    POST /api/contact
+    Expected JSON payload:
+    {
+      "name": "User Name",
+      "email": "user@email.com",
+      "subject": "Technical Issue",
+      "message": "My reservation is not confirmed"
+    }
+
+    Saves the query to a file and optionally sends an email to ridewisebike@gmail.com if SMTP is configured.
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        payload = request.get_json(force=True)
+        if not payload:
+            return jsonify({'error': 'No JSON body provided'}), 400
+
+        name = (payload.get('name') or '').strip()
+        email = (payload.get('email') or '').strip()
+        subject = (payload.get('subject') or '').strip()
+        message = (payload.get('message') or '').strip()
+
+        # Basic validation
+        if not name or not email or not subject or not message:
+            return jsonify({'error': 'All fields are required.'}), 400
+        if len(message) < 10:
+            return jsonify({'error': 'Message must be at least 10 characters.'}), 400
+        if '@' not in email or '.' not in email:
+            return jsonify({'error': 'Invalid email address.'}), 400
+
+        # Always save query to file (no SMTP required)
+        from datetime import datetime
+        query_entry = {
+            'id': len(contact_queries) + 1,
+            'name': name,
+            'email': email,
+            'subject': subject,
+            'message': message,
+            'timestamp': datetime.now().isoformat(),
+            'recipient': 'ridewisebike@gmail.com'
+        }
+        contact_queries.append(query_entry)
+        save_contact_queries()
+        logger.info("[Contact] Query saved from %s <%s>: %s", name, email, subject)
+
+        # Try to send email if SMTP is configured (optional)
+        recipient = 'ridewisebike@gmail.com'
+        smtp_email = os.environ.get('SMTP_EMAIL')
+        smtp_password = os.environ.get('SMTP_PASSWORD')
+
+        if smtp_email and smtp_password:
+            try:
+                # Compose email
+                email_msg = EmailMessage()
+                email_msg['Subject'] = f"[RideWise Query] {subject}"
+                email_msg['From'] = smtp_email
+                email_msg['To'] = recipient
+                body = f"Name: {name}\nUser Email: {email}\n\nMessage:\n{message}"
+                email_msg.set_content(body)
+
+                # Send using Gmail SMTP over SSL
+                with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+                    smtp.login(smtp_email, smtp_password)
+                    smtp.send_message(email_msg)
+                logger.info("[Contact] Email sent from %s <%s> to %s", name, email, recipient)
+            except Exception as send_err:
+                logger.warning("[Contact] Failed to send email (query saved to file): %s", send_err)
+                # Don't fail - query is already saved
+        else:
+            logger.info("[Contact] SMTP not configured - query saved to file only")
+
+        # Always return success if query is saved
+        return jsonify({'status': 'success', 'message': 'Your query has been received and will be sent to ridewisebike@gmail.com'}), 201
+
+    except Exception as e:
+        logger.exception("Error in /api/contact: %s", e)
+        return jsonify({'error': 'An unexpected error occurred.'}), 500
+
+
+@app.route('/api/reviews', methods=['POST', 'OPTIONS'])
+def submit_review():
+    """
+    POST endpoint to submit user review.
+    
+    Request body:
+    {
+        "user_email": "user@example.com",
+        "rating": 1-5,
+        "comment": "review text"
+    }
+    
+    Returns:
+    {
+        "status": "success",
+        "review_id": 123
+    }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        payload = request.get_json(force=True)
+        
+        if not payload:
+            return jsonify({'error': 'No JSON body provided'}), 400
+        
+        # Validate required fields
+        user_email = payload.get('user_email', '').strip()
+        rating = payload.get('rating')
+        comment = payload.get('comment', '').strip()
+        
+        if not user_email or rating is None or not comment:
+            return jsonify({'error': 'Missing user_email, rating, or comment'}), 400
+        
+        try:
+            rating = int(rating)
+            if rating < 1 or rating > 5:
+                return jsonify({'error': 'Rating must be between 1 and 5'}), 400
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Rating must be an integer'}), 400
+        
+        # Initialize user reviews if not exists
+        if user_email not in reviews_db:
+            reviews_db[user_email] = []
+        
+        # Generate review ID
+        review_id = len(reviews_db[user_email]) + 1
+        
+        # Store review with timestamp
+        from datetime import datetime
+        review_entry = {
+            'id': review_id,
+            'rating': rating,
+            'comment': comment,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        reviews_db[user_email].append(review_entry)
+        print(f"[Review] Received from {user_email}: {rating}★ - {comment[:50]}...")
+        
+        # Save reviews to file
+        save_reviews()
+        
+        return jsonify({'status': 'success', 'review_id': review_id}), 201
+    
+    except Exception as e:
+        print(f"[Review] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/reviews', methods=['GET'])
+def get_reviews():
+    """
+    GET endpoint to retrieve user reviews.
+    
+    Query params:
+    - user_email: string
+    
+    Returns:
+    {
+        "reviews": [
+            { "id": 1, "rating": 5, "comment": "...", "timestamp": "..." },
+            ...
+        ]
+    }
+    """
+    try:
+        user_email = request.args.get('user_email', '').strip()
+        if not user_email:
+            return jsonify({'error': 'user_email query parameter required'}), 400
+        
+        user_reviews = reviews_db.get(user_email, [])
+        return jsonify({'reviews': user_reviews}), 200
+    
+    except Exception as e:
+        print(f"[Review] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/reviews/all', methods=['GET'])
+def get_all_reviews():
+    """
+    GET endpoint to retrieve all reviews from all users.
+    
+    Returns:
+    {
+        "reviews": [
+            { "user_email": "...", "id": 1, "rating": 5, "comment": "...", "timestamp": "..." },
+            ...
+        ]
+    }
+    """
+    try:
+        all_reviews = []
+        for user_email, user_reviews in reviews_db.items():
+            for review in user_reviews:
+                all_reviews.append({
+                    "user_email": user_email,
+                    "id": review["id"],
+                    "rating": review["rating"],
+                    "comment": review["comment"],
+                    "timestamp": review["timestamp"]
+                })
+        
+        # Sort by timestamp descending (latest first)
+        all_reviews.sort(key=lambda x: x["timestamp"], reverse=True)
+        
+        return jsonify({'reviews': all_reviews}), 200
+    
+    except Exception as e:
+        print(f"[Review] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/stations', methods=['GET'])
+def get_stations():
+    """
+    GET endpoint to provide station data for the Leaflet map.
+    Returns a simulated set of stations across India.
+    In a production setup, replace this with database-backed data.
+    """
+    try:
+        stations = []
+        for item in STATION_SEED_DATA:
+            # Add small random variation to keep data from feeling static
+            available = max(0, item["base_bikes"] + random.randint(-8, 5))
+            stations.append({
+                "station_id": item["station_id"],
+                "station_name": item["station_name"],
+                "lat": item["lat"],
+                "lng": item["lng"],
+                "available_bikes": available,
+                "demand_level": _derive_demand_level(available),
+            })
+        return jsonify(stations), 200
+    except Exception as e:
+        logger.exception("Failed to build stations response: %s", e)
+        return jsonify({"error": "Failed to load stations"}), 500
+
+
+@app.route('/api/reserve', methods=['POST', 'OPTIONS'])
+def reserve_bike():
+    """
+    Create a bike reservation (in-memory).
+
+    Request JSON:
+    {
+      "date": "YYYY-MM-DD",
+      "time_slot": "Morning" | "Afternoon" | "Evening" | "Night",
+      "station_id": "DEL-CP-01",
+      "predicted_demand": "High" | "Medium" | "Low",
+      "user_email": "user@example.com"
+    }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+
+        date = str(payload.get("date", "")).strip()
+        time_slot = str(payload.get("time_slot", "")).strip()
+        station_id = str(payload.get("station_id", "")).strip()
+        predicted_demand = str(payload.get("predicted_demand", "")).strip()
+        user_email = str(payload.get("user_email", "")).strip()
+
+        # Validate inputs safely (no auth/db as requested)
+        allowed_time_slots = {"Morning", "Afternoon", "Evening", "Night"}
+        allowed_demand = {"High", "Medium", "Low"}
+
+        if not date or len(date) != 10:
+            return jsonify({"error": "Invalid or missing date. Use YYYY-MM-DD."}), 400
+        if time_slot not in allowed_time_slots:
+            return jsonify({"error": "Invalid time_slot. Use Morning/Afternoon/Evening/Night."}), 400
+        if predicted_demand not in allowed_demand:
+            return jsonify({"error": "Invalid predicted_demand. Use High/Medium/Low."}), 400
+        if station_id not in STATION_BY_ID:
+            return jsonify({"error": "Invalid station_id."}), 400
+        if not user_email or "@" not in user_email:
+            return jsonify({"error": "Invalid or missing user_email."}), 400
+
+        station = STATION_BY_ID[station_id]
+        price = _calculate_reservation_price(predicted_demand, time_slot)
+        reservation_id = _generate_reservation_id()
+
+        reservation = {
+            "reservation_id": reservation_id,
+            "station_id": station_id,
+            "station": station["station_name"],
+            "date": date,
+            "time_slot": time_slot,
+            "predicted_demand": predicted_demand,
+            "price": price,
+            "status": "Confirmed",
+        }
+        
+        # Store by user_email
+        if user_email not in reservations:
+            reservations[user_email] = []
+        reservations[user_email].append(reservation)
+
+        # Response format requested (keep only required fields + status)
+        return jsonify({
+            "reservation_id": reservation_id,
+            "station": station["station_name"],
+            "date": date,
+            "time_slot": time_slot,
+            "price": price,
+            "status": "Confirmed",
+        }), 200
+    except Exception as e:
+        logger.exception("Reservation error: %s", e)
+        return jsonify({"error": "Failed to create reservation"}), 500
+
+
+@app.route('/api/reservations', methods=['GET'])
+def get_user_reservations():
+    """
+    Get user reservations.
+    
+    Query params:
+    - user_email: string
+    """
+    try:
+        user_email = request.args.get('user_email', '').strip()
+        if not user_email:
+            return jsonify({"error": "user_email required"}), 400
+        
+        user_reservations = reservations.get(user_email, [])
+        return jsonify({"reservations": user_reservations}), 200
+    except Exception as e:
+        logger.exception("Get reservations error: %s", e)
+        return jsonify({"error": "Failed to get reservations"}), 500
+
+
+@app.route('/api/reservations/<reservation_id>', methods=['PUT'])
+def update_reservation(reservation_id):
+    """
+    Update a reservation.
+    
+    Request JSON:
+    {
+      "user_email": "user@example.com",
+      "date": "YYYY-MM-DD",
+      "time_slot": "Morning" | "Afternoon" | "Evening" | "Night",
+      "station_id": "DEL-CP-01"
+    }
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        user_email = str(payload.get("user_email", "")).strip()
+        
+        if not user_email:
+            return jsonify({"error": "user_email required"}), 400
+        
+        user_reservations = reservations.get(user_email, [])
+        reservation = next((r for r in user_reservations if r["reservation_id"] == reservation_id), None)
+        
+        if not reservation:
+            return jsonify({"error": "Reservation not found"}), 404
+        
+        # Update fields
+        if "date" in payload:
+            reservation["date"] = str(payload["date"]).strip()
+        if "time_slot" in payload:
+            time_slot = str(payload["time_slot"]).strip()
+            if time_slot in {"Morning", "Afternoon", "Evening", "Night"}:
+                reservation["time_slot"] = time_slot
+        if "station_id" in payload:
+            station_id = str(payload["station_id"]).strip()
+            if station_id in STATION_BY_ID:
+                station = STATION_BY_ID[station_id]
+                reservation["station_id"] = station_id
+                reservation["station"] = station["station_name"]
+                # Recalculate price if demand or time changed
+                reservation["price"] = _calculate_reservation_price(reservation["predicted_demand"], reservation["time_slot"])
+        
+        return jsonify({"message": "Reservation updated", "reservation": reservation}), 200
+    except Exception as e:
+        logger.exception("Update reservation error: %s", e)
+        return jsonify({"error": "Failed to update reservation"}), 500
+
+
+@app.route('/api/reservations/<reservation_id>', methods=['DELETE'])
+def cancel_reservation(reservation_id):
+    """
+    Cancel a reservation.
+    
+    Query params:
+    - user_email: string
+    """
+    try:
+        user_email = request.args.get('user_email', '').strip()
+        if not user_email:
+            return jsonify({"error": "user_email required"}), 400
+        
+        user_reservations = reservations.get(user_email, [])
+        for i, r in enumerate(user_reservations):
+            if r["reservation_id"] == reservation_id:
+                r["status"] = "Cancelled"
+                return jsonify({"message": "Reservation cancelled"}), 200
+        
+        return jsonify({"error": "Reservation not found"}), 404
+    except Exception as e:
+        logger.exception("Cancel reservation error: %s", e)
+        return jsonify({"error": "Failed to cancel reservation"}), 500
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    print(f"\n{'='*60}")
+    print("RideWise Backend Server Starting")
+    print(f"{'='*60}")
+    print(f"Server: http://0.0.0.0:{port}")
+    print(f"Health: GET http://localhost:{port}/health")
+    print(f"Daily Predict: POST http://localhost:{port}/predict/day")
+    print(f"Hour Predict: POST http://localhost:{port}/predict/hour")
+    print(f"Dashboard: GET http://localhost:{port}/dashboard/summary")
+    print(f"Chatbot: POST http://localhost:{port}/chat")
+    print(f"Chatbot Status: GET http://localhost:{port}/chat/status")
+    print(f"Feedback: POST http://localhost:{port}/feedback")
+    print(f"Reviews: POST/GET http://localhost:{port}/api/reviews")
+    print(f"All Reviews: GET http://localhost:{port}/api/reviews/all")
+    print(f"Reservations: POST http://localhost:{port}/api/reserve")
+    print(f"User Reservations: GET http://localhost:{port}/api/reservations")
+    print(f"Update Reservation: PUT http://localhost:{port}/api/reservations/<id>")
+    print(f"Cancel Reservation: DELETE http://localhost:{port}/api/reservations/<id>")
+    if model is None:
+        print(f"\n⚠️  WARNING: Chatbot is unavailable - GEMINI_API_KEY not configured")
+        print(f"   See CHATBOT_SETUP.md for setup instructions")
+    else:
+        print(f"\n✅ Chatbot: Ready")
+    print(f"CORS: Enabled for http://localhost:3000")
+    print(f"{'='*60}\n")
+    app.run(host='0.0.0.0', port=port, debug=True)
